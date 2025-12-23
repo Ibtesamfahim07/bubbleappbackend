@@ -1,0 +1,77 @@
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Logs
+logs/
+*.log
+*.log.*
+debug.log
+error.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+tmp/
+temp/
+
+# TypeScript
+*.tsbuildinfo
+
+# Production
+coverage/
+.cache/
+.next/
+vercel/
+out/
+
+# PM2 logs
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor folders
+.vscode/
+.idea/
+
+# Sequelize migration temp files
+migrations-lock.json
+
+# Local Database files
+*.sqlite
+*.sqlite3
+
+# Uploaded files
+uploads/
+public/uploads/
+
+# Any local secrets or keys
+*.pem
+*.key
+*.crt
+
+# macOS + Windows system junk
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# Optional – If you use Redis or Docker locally
+redis-data/
+docker-data/
+
+# Optional – Cache folders
+.cache/
+parcel-cache/
