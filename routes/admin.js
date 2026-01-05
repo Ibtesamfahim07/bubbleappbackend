@@ -126,6 +126,171 @@
     }
   });
 
+
+// ==================== USER BUBBLE BREAKDOWN ====================
+// Get bubble breakdown for a specific user (giveaway vs support)
+router.get('/users/:id/bubble-breakdown', async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    console.log(`\n💰 ==================== ADMIN: BUBBLE BREAKDOWN ====================`);
+    console.log(`   User ID: ${userId}`);
+
+    const user = await User.findByPk(userId, {
+      attributes: ['id', 'name', 'bubblesCount']
+    });
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    console.log(`   User: ${user.name}`);
+    console.log(`   Current Total: ${user.bubblesCount} bubbles`);
+
+    // 1. Get GIVEAWAY bubbles (received from giveaway distributions)
+    const giveawayResult = await sequelize.query(`
+      SELECT 
+        COALESCE(SUM(bubbleAmount), 0) as totalGiveaway,
+        COUNT(*) as giveawayCount
+      FROM bubble_transactions
+      WHERE toUserId = :userId
+        AND status = 'completed'
+        AND (
+          giveaway = 1 
+          OR description LIKE '%Giveaway Distribution%'
+          OR description LIKE '%Grocery Giveaway%'
+          OR description LIKE '%Medical Giveaway%'
+          OR description LIKE '%Education Giveaway%'
+        )
+    `, {
+      replacements: { userId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const giveawayBubbles = parseInt(giveawayResult[0]?.totalGiveaway || 0);
+    const giveawayCount = parseInt(giveawayResult[0]?.giveawayCount || 0);
+
+    console.log(`   ✅ Giveaway Bubbles: ${giveawayBubbles} (${giveawayCount} transactions)`);
+
+    // 2. Get SUPPORT bubbles (received from other users supporting)
+    const supportResult = await sequelize.query(`
+      SELECT 
+        COALESCE(SUM(bubbleAmount), 0) as totalSupport,
+        COUNT(*) as supportCount
+      FROM bubble_transactions
+      WHERE toUserId = :userId
+        AND status = 'completed'
+        AND type = 'support'
+        AND (giveaway = 0 OR giveaway IS NULL)
+    `, {
+      replacements: { userId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const supportBubbles = parseInt(supportResult[0]?.totalSupport || 0);
+    const supportCount = parseInt(supportResult[0]?.supportCount || 0);
+
+    console.log(`   ✅ Support Bubbles: ${supportBubbles} (${supportCount} transactions)`);
+
+    // 3. Get DEPOSITED bubbles (from wallet)
+    const depositResult = await sequelize.query(`
+      SELECT COALESCE(SUM(amount), 0) as totalDeposited
+      FROM wallettransactions
+      WHERE userId = :userId
+        AND type = 'bubble_deposit'
+    `, {
+      replacements: { userId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const depositedBubbles = parseInt(depositResult[0]?.totalDeposited || 0);
+
+    console.log(`   ✅ Deposited Bubbles: ${depositedBubbles}`);
+
+    // 4. Get SPENT bubbles (sent to others)
+    const spentResult = await sequelize.query(`
+      SELECT COALESCE(SUM(bubbleAmount), 0) as totalSpent
+      FROM bubble_transactions
+      WHERE fromUserId = :userId
+        AND status = 'completed'
+        AND type IN ('support', 'donation', 'transfer')
+    `, {
+      replacements: { userId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const spentBubbles = parseInt(spentResult[0]?.totalSpent || 0);
+
+    console.log(`   ✅ Spent Bubbles: ${spentBubbles}`);
+
+    // 5. Get ADMIN SUPPORT bubbles (from admin offer support)
+    const adminSupportResult = await sequelize.query(`
+      SELECT 
+        COALESCE(SUM(bubbleAmount), 0) as totalAdminSupport,
+        COUNT(*) as adminSupportCount
+      FROM bubble_transactions
+      WHERE toUserId = :userId
+        AND status = 'completed'
+        AND type = 'admin_offer_support'
+    `, {
+      replacements: { userId },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const adminSupportBubbles = parseInt(adminSupportResult[0]?.totalAdminSupport || 0);
+    const adminSupportCount = parseInt(adminSupportResult[0]?.adminSupportCount || 0);
+
+    console.log(`   ✅ Admin Support Bubbles: ${adminSupportBubbles} (${adminSupportCount} transactions)`);
+
+    console.log(`   ────────────────────────────────────────────────────────`);
+    console.log(`   📊 BREAKDOWN:`);
+    console.log(`      Deposited:        ${depositedBubbles}`);
+    console.log(`      From Support:     ${supportBubbles}`);
+    console.log(`      From Giveaway:    ${giveawayBubbles}`);
+    console.log(`      From Admin:       ${adminSupportBubbles}`);
+    console.log(`      Spent:            -${spentBubbles}`);
+    console.log(`      ────────────────────`);
+    console.log(`      Current Balance:  ${user.bubblesCount}`);
+    console.log(`   ══════════════════════════════════════════════════════\n`);
+
+    const response = {
+      userId: user.id,
+      userName: user.name,
+      totalBubbles: user.bubblesCount,
+      giveawayBubbles: giveawayBubbles,
+      supportBubbles: supportBubbles,
+      depositedBubbles: depositedBubbles,
+      adminSupportBubbles: adminSupportBubbles,
+      spentBubbles: spentBubbles,
+      breakdown: {
+        deposited: depositedBubbles,
+        fromSupport: supportBubbles,
+        fromGiveaway: giveawayBubbles,
+        fromAdminSupport: adminSupportBubbles,
+        spent: spentBubbles,
+        current: user.bubblesCount
+      },
+      transactionCounts: {
+        giveaway: giveawayCount,
+        support: supportCount,
+        adminSupport: adminSupportCount
+      }
+    };
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('❌ Admin bubble breakdown error:', error);
+    res.status(400).json({ 
+      message: error.message || 'Failed to get bubble breakdown',
+      error: error.toString()
+    });
+  }
+});
+
+
+
+
   // ==================== USER BUBBLES ====================
 
   // Get user's bubbles (from BubbleTransaction - where user is receiver)
@@ -1134,483 +1299,359 @@
 
   // routes/admin.js - FIXED Giveaway Routes (place AFTER adminAuth middleware)
 
-  // ==================== GIVEAWAY MANAGEMENT ====================
+  // ==================== GIVEAWAY MANAGEMENT - PERCENTAGE BASED ====================
 
-  // 1. GET stats - shows eligible users count and active giveaways from DB
-  router.get('/giveaway/stats', async (req, res) => {
-    try {
-      console.log('🔵 GET /admin/giveaway/stats called');
-      
-      const eligibleUsersCount = await sequelize.query(`
-        SELECT COUNT(DISTINCT fromUserId) as count
-        FROM bubble_transactions 
-        WHERE type = 'back'
-        AND status = 'completed'
-      `, {
-        type: sequelize.QueryTypes.SELECT
-      });
-
-      console.log('Eligible users count:', eligibleUsersCount);
-
-      const activeGiveaways = await Giveaway.findAll({ 
-        where: { distributed: false },
-        attributes: ['id', 'category', 'amountPerUser', 'totalAmount', 'isActive', 'createdAt', 'updatedAt'],  // ✅ ADDED isActive
-        order: [['category', 'ASC']],
-        raw: true
-      });
-
-      console.log('Active giveaways:', activeGiveaways);
-
-      res.json({
-        eligibleUsers: eligibleUsersCount[0]?.count || 0,
-        activeGiveaways: activeGiveaways || []
-      });
-    } catch (e) { 
-      console.error('❌ Giveaway stats error:', e);
-      res.status(500).json({ message: e.message }); 
-    }
-  });
-
-  // 2. POST /admin/giveaway/set - Create giveaway records in DB
-  router.post('/giveaway/set', async (req, res) => {
-    console.log('ðŸ”µ POST /admin/giveaway/set called');
-    console.log('ðŸ“¦ Request body:', req.body);
-    console.log('ðŸ‘¤ Admin ID:', req.user?.id);
+// 1. GET stats - shows eligible users count and active giveaways
+router.get('/giveaway/stats', async (req, res) => {
+  try {
+    console.log('🔵 GET /admin/giveaway/stats called');
     
-    const { amountPerUser } = req.body;
-    const adminId = req.user.id;
-    
-    // Validate input
-    if (!amountPerUser) {
-      console.error('âŒ ERROR: amountPerUser is missing');
-      return res.status(400).json({ message: 'amountPerUser is required' });
+    const eligibleUsersCount = await sequelize.query(`
+      SELECT COUNT(DISTINCT fromUserId) as count
+      FROM bubble_transactions 
+      WHERE type = 'back'
+      AND status = 'completed'
+    `, {
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    const activeGiveaways = await Giveaway.findAll({ 
+      where: { distributed: false },
+      attributes: ['id', 'category', 'percentagePerUser', 'amountPerUser', 'totalAmount', 'holdAmount', 'isActive', 'createdAt', 'updatedAt'],
+      order: [['category', 'ASC']],
+      raw: true
+    });
+
+    const giveawaysWithPool = activeGiveaways.map(g => ({
+      ...g,
+      availablePool: (g.totalAmount || 0) + (g.holdAmount || 0)
+    }));
+
+    res.json({
+      eligibleUsers: eligibleUsersCount[0]?.count || 0,
+      activeGiveaways: giveawaysWithPool || []
+    });
+  } catch (e) { 
+    console.error('❌ Giveaway stats error:', e);
+    res.status(500).json({ message: e.message }); 
+  }
+});
+
+// 2. POST /admin/giveaway/set - Create giveaway with percentage
+router.post('/giveaway/set', async (req, res) => {
+  console.log('🔵 POST /admin/giveaway/set called');
+  console.log('📦 Request body:', req.body);
+  
+  const { percentagePerUser, categories } = req.body;
+  const adminId = req.user.id;
+  
+  const parsedPercentage = parseFloat(percentagePerUser);
+  
+  if (isNaN(parsedPercentage) || parsedPercentage <= 0 || parsedPercentage > 100) {
+    return res.status(400).json({ message: 'Percentage must be between 1 and 100' });
+  }
+
+  const enabledCategories = categories || ['Medical', 'Grocery', 'Education'];
+
+  const t = await sequelize.transaction();
+  try {
+    console.log('💰 Creating giveaways with percentage:', parsedPercentage);
+
+    // Get existing hold amounts before deleting
+    const oldGiveaways = await Giveaway.findAll({ 
+      where: { distributed: false },
+      transaction: t 
+    });
+
+    let totalHoldAmount = 0;
+    for (const old of oldGiveaways) {
+      totalHoldAmount += old.holdAmount || 0;
     }
 
-    const parsedAmount = parseInt(amountPerUser);
-    
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      console.error('âŒ ERROR: amountPerUser <= 0:', amountPerUser);
-      return res.status(400).json({ message: 'amountPerUser must be > 0' });
-    }
+    await Giveaway.destroy({ 
+      where: { distributed: false },
+      transaction: t 
+    });
 
-    const t = await sequelize.transaction();
-    try {
-      console.log('ðŸ’° Creating giveaways with amount:', parsedAmount);
+    const holdPerCategory = Math.floor(totalHoldAmount / enabledCategories.length);
 
-      const categories = ['Medical', 'Grocery', 'Education'];
-
-      // Delete old undistributed giveaways
-      console.log('ðŸ—‘ï¸  Deleting old giveaways');
-      const deletedCount = await Giveaway.destroy({ 
-        where: { distributed: false },
-        transaction: t 
-      });
-      console.log(`âœ… Deleted ${deletedCount} old giveaways`);
-
-      // Create new giveaway records for each category
-      const createdGiveaways = [];
-      for (const category of categories) {
-        console.log(`ðŸ“ Creating giveaway for ${category}`);
-        
-        const giveaway = await Giveaway.create({ 
-          category, 
-          amountPerUser: parsedAmount,
-          totalAmount: 0,
-          distributed: false,
-          setByAdminId: adminId
-        }, { transaction: t });
-
-        createdGiveaways.push({
-          id: giveaway.id,
-          category: giveaway.category,
-          amountPerUser: giveaway.amountPerUser,
-          distributed: giveaway.distributed,
-          createdAt: giveaway.createdAt
-        });
-
-        console.log(`âœ… Created - ID: ${giveaway.id}, Category: ${category}, Amount: ${parsedAmount}`);
-      }
-      
-      await t.commit();
-      console.log('âœ… Transaction committed');
-
-      res.json({ 
-        message: 'Giveaway set successfully',
-        amountPerUser: parsedAmount,
-        createdGiveaways: createdGiveaways
-      });
-
-    } catch (e) {
-      await t.rollback();
-      console.error('âŒ Set giveaway error:', e);
-      console.error('Stack:', e.stack);
-      res.status(500).json({ message: e.message || 'Failed to set giveaway' });
-    }
-  });
-
-  // 3. POST /admin/giveaway/reset - Delete all giveaways
-  router.post('/giveaway/reset', async (req, res) => {
-    try {
-      console.log('ðŸ”µ POST /admin/giveaway/reset called');
-      
-      const result = await Giveaway.destroy({ 
-        where: { distributed: false } 
-      });
-
-      console.log(`âœ… Deleted ${result} giveaway records`);
-
-      res.json({ 
-        message: 'All giveaways reset',
-        deletedCount: result
-      });
-    } catch (e) {
-      console.error('âŒ Reset giveaway error:', e);
-      res.status(500).json({ message: e.message }); 
-    }
-  });
-
-  // NEW ENDPOINT: Toggle category active status
-  router.post('/giveaway/:category/toggle', async (req, res) => {
-    const { category } = req.params;
-    const { isActive } = req.body;
-
-    if (!['Medical', 'Grocery', 'Education'].includes(category)) {
-      return res.status(400).json({ message: 'Invalid category' });
-    }
-
-    if (typeof isActive !== 'boolean') {
-      return res.status(400).json({ message: 'isActive must be a boolean' });
-    }
-
-    try {
-      console.log(`🔄 Toggling ${category} giveaway to ${isActive ? 'ACTIVE' : 'INACTIVE'}`);
-      
-      const giveaway = await Giveaway.findOne({
-        where: { category, distributed: false }
-      });
-
-      if (!giveaway) {
-        return res.status(404).json({ message: `No active ${category} giveaway found` });
-      }
-
-      giveaway.isActive = isActive;
-      await giveaway.save();
-
-      console.log(`✅ ${category} giveaway is now ${isActive ? 'ACTIVE' : 'INACTIVE'}`);
-
-      res.json({
-        message: `${category} giveaway ${isActive ? 'enabled' : 'disabled'}`,
-        giveaway: {
-          id: giveaway.id,
-          category: giveaway.category,
-          amountPerUser: giveaway.amountPerUser,
-          isActive: giveaway.isActive
-        }
-      });
-    } catch (e) {
-      console.error('❌ Toggle category error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  // NEW ENDPOINT: Update amount for specific category
-  router.post('/giveaway/:category/update-amount', async (req, res) => {
-    const { category } = req.params;
-    const { amountPerUser } = req.body;
-
-    if (!['Medical', 'Grocery', 'Education'].includes(category)) {
-      return res.status(400).json({ message: 'Invalid category' });
-    }
-
-    const parsedAmount = parseInt(amountPerUser);
-    if (isNaN(parsedAmount) || parsedAmount <= 0) {
-      return res.status(400).json({ message: 'amountPerUser must be > 0' });
-    }
-
-    try {
-      console.log(`💰 Updating ${category} giveaway amount to ${parsedAmount}`);
-      
-      const giveaway = await Giveaway.findOne({
-        where: { category, distributed: false }
-      });
-
-      if (!giveaway) {
-        return res.status(404).json({ message: `No active ${category} giveaway found` });
-      }
-
-      giveaway.amountPerUser = parsedAmount;
-      await giveaway.save();
-
-      console.log(`✅ ${category} amount updated to ${parsedAmount}`);
-
-      res.json({
-        message: `${category} amount updated`,
-        giveaway: {
-          id: giveaway.id,
-          category: giveaway.category,
-          amountPerUser: giveaway.amountPerUser,
-          isActive: giveaway.isActive
-        }
-      });
-    } catch (e) {
-      console.error('❌ Update amount error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-
-  // 4. GET /admin/giveaway/:category - Get single category
-  router.get('/giveaway/:category', async (req, res) => {
-    const { category } = req.params;
-
-    if (!['Medical', 'Grocery', 'Education'].includes(category)) {
-      return res.status(400).json({ message: 'Invalid category' });
-    }
-
-    try {
-      const giveaway = await Giveaway.findOne({
-        where: { category, distributed: false },
-        attributes: ['id', 'category', 'amountPerUser', 'totalAmount', 'distributed', 'createdAt', 'updatedAt'],
-        raw: true
-      });
-
-      if (!giveaway) {
-        return res.json({ found: false, message: 'No active giveaway' });
-      }
-
-      res.json({ found: true, giveaway });
-    } catch (e) {
-      console.error('âŒ Get giveaway error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  // 5. POST /admin/giveaway/:category/reset - Reset specific category
-  router.post('/giveaway/:category/reset', async (req, res) => {
-    const { category } = req.params;
-
-    if (!['Medical', 'Grocery', 'Education'].includes(category)) {
-      return res.status(400).json({ message: 'Invalid category' });
-    }
-
-    try {
-      const result = await Giveaway.destroy({ 
-        where: { category, distributed: false } 
-      });
-
-      res.json({ 
-        message: `${category} giveaway reset`,
-        deletedCount: result
-      });
-    } catch (e) {
-      console.error('âŒ Reset category error:', e);
-      res.status(500).json({ message: e.message });
-    }
-  });
-
-  // 2. POST /admin/giveaway/distribute  â†’ **USER DONATES**
-  // ---------------------------------------------------------------
-  // FIXED: /admin/giveaway/distribute â†’ SINGLE 400-BUBBLE TRANSACTION PER USER (NO ROUNDS)
-  router.post('/giveaway/distribute', async (req, res) => {
-    const { userId, category, bubbles } = req.body;
-
-    if (!userId || !category || !bubbles || bubbles <= 0) {
-      return res.status(400).json({ message: 'userId, category, bubbles (>0) required' });
-    }
-
-    const t = await sequelize.transaction();
-    try {
-      console.log(`\nðŸŽ GIVEAWAY DISTRIBUTION START`);
-      console.log(`   Donor: User ${userId}`);
-      console.log(`   Category: ${category}`);
-      console.log(`   Total Bubbles: ${bubbles}`);
-
-      // ----- 1. Donor validation -------------------------------------------------
-      const donor = await User.findByPk(userId, { transaction: t, lock: t.LOCK.UPDATE });
-      if (!donor) throw new Error('Donor not found');
-      if (donor.bubblesCount < bubbles) {
-        throw new Error(`Insufficient bubbles. You have ${donor.bubblesCount}, trying to donate ${bubbles}`);
-      }
-
-      // ----- 2. Giveaway validation --------------------------------------------
-      const giveaway = await Giveaway.findOne({
-        where: { category, distributed: false },
-        transaction: t,
-        lock: t.LOCK.UPDATE,
-      });
-      if (!giveaway) throw new Error(`No active ${category} giveaway. Admin hasn't set it up yet.`);
-      if (!giveaway.isActive) throw new Error(`${category} giveaway is currently disabled by admin.`);
-
-      const amountPerUser = giveaway.amountPerUser;
-      if (amountPerUser <= 0) throw new Error('Invalid giveaway amount per user');
-
-      console.log(`   Amount per user: ${amountPerUser}`);
-
-      // ----- 3. Deduct from donor ------------------------------------
-      donor.bubblesCount -= bubbles;
-      await donor.save({ transaction: t });
-      console.log(`   âœ… Deducted ${bubbles} from donor. New balance: ${donor.bubblesCount}`);
-
-      // ----- 4. Record DONATION transaction ----------
-      await BubbleTransaction.create({
-        fromUserId: userId,
-        toUserId: userId,
-        bubbleAmount: bubbles,
-        type: 'donation',
-        status: 'completed',
-        giveaway: 1,
-        description: `Donated ${bubbles} bubbles to ${category} Giveaway`,
+    const createdGiveaways = [];
+    for (const category of enabledCategories) {
+      const giveaway = await Giveaway.create({ 
+        category, 
+        percentagePerUser: parsedPercentage,
+        amountPerUser: 0,
+        totalAmount: 0,
+        holdAmount: holdPerCategory,
+        distributed: false,
+        isActive: true,
+        setByAdminId: adminId
       }, { transaction: t });
-      console.log(`   âœ… Recorded donation transaction`);
 
-      // ----- 5. Get ALL eligible users ----------
-      // NEW LOGIC: Only users who have RETURNED bubbles (type='back') are eligible for giveaways
-      const eligibleResult = await sequelize.query(`
-        SELECT u.id, u.name, u.createdAt,
-              COALESCE(SUM(bt.bubbleAmount), 0) AS totalReturned
-        FROM Users u
-        JOIN bubble_transactions bt ON bt.fromUserId = u.id
-        WHERE u.isActive = 1 
-          AND u.id != :donorId
-          AND bt.type = 'back'
-          AND bt.status = 'completed'
-          
-        GROUP BY u.id, u.name, u.createdAt
-        ORDER BY totalReturned DESC, u.createdAt ASC
-      `, {
-        replacements: { donorId: userId },
-        type: sequelize.QueryTypes.SELECT,
-        transaction: t,
+      createdGiveaways.push({
+        id: giveaway.id,
+        category: giveaway.category,
+        percentagePerUser: giveaway.percentagePerUser,
+        holdAmount: giveaway.holdAmount,
+        createdAt: giveaway.createdAt
       });
-
-      const eligibleCount = eligibleResult.length;
-      giveaway.eligibleUsers = eligibleCount;
-
-      console.log(`   ðŸ“Š Total eligible users: ${eligibleCount}`);
-      
-      if (eligibleCount === 0) {
-        await t.rollback();
-        return res.status(400).json({ 
-          message: 'No eligible users found. Users must donate to others first to receive giveaways.' 
-        });
-      }
-
-      // ----- 6. Compute single distribution -----
-      const totalNeeded = eligibleCount * amountPerUser;
-      let totalDistributed = Math.min(totalNeeded, bubbles);
-
-      // Calculate actual per-user amount (if donor gave fewer bubbles)
-      const actualAmountPerUser = Math.floor(totalDistributed / eligibleCount);
-
-      console.log(`\n   ðŸ’° ONE-TIME DISTRIBUTION: ${actualAmountPerUser} bubbles per user`);
-
-      const transactionsToCreate = eligibleResult.map((user, index) => ({
-        fromUserId: userId,
-        toUserId: user.id,
-        bubbleAmount: actualAmountPerUser,
-        type: 'transfer',
-        status: 'completed',
-        giveaway: 1,
-        description: `${category} Giveaway Distribution`,
-        createdAt: new Date(),
-        updatedAt: new Date()
-      }));
-
-      const recipientsList = eligibleResult.map((user, index) => ({
-        rank: index + 1,
-        userId: user.id,
-        name: user.name,
-        totalReturned: user.totalReturned,
-        received: actualAmountPerUser,
-        transactionCount: 1
-      }));
-
-      console.log(`   ðŸš€ Executing bulk insert for ${eligibleCount} users...`);
-      await BubbleTransaction.bulkCreate(transactionsToCreate, { transaction: t });
-      console.log(`   âœ… Created ${transactionsToCreate.length} transactions (ONE per user)`);
-
-      // ----- 7. Bulk update balances -----
-      await sequelize.query(`
-        UPDATE Users 
-        SET bubblesCount = bubblesCount + :amount
-        WHERE id IN (:userIds)
-      `, {
-        replacements: {
-          amount: actualAmountPerUser,
-          userIds: eligibleResult.map(u => u.id),
-        },
-        transaction: t
-      });
-      console.log(`   âœ… Updated ${eligibleCount} user balances`);
-
-      // ----- 8. Mark giveaway distributed -----
-      giveaway.totalDonated = (giveaway.totalDonated || 0) + totalDistributed;
-      giveaway.distributed = true;
-      giveaway.distributedAt = new Date();
-      await giveaway.save({ transaction: t });
-
-      await t.commit();
-      console.log(`âœ… COMPLETE - ${eligibleCount} users received ${actualAmountPerUser} bubbles each (ONE transaction each)\n`);
-
-      res.json({
-        success: true,
-        message: `Successfully distributed ${totalDistributed} bubbles to ${eligibleCount} users (ONE transaction each)`,
-        distribution: {
-          giveawayId: giveaway.id,
-          category,
-          amountPerUser: actualAmountPerUser,
-          totalDonated: totalDistributed,
-          recipientCount: eligibleCount,
-          transactionCount: transactionsToCreate.length,
-          recipients: recipientsList
-        },
-      });
-    } catch (e) {
-      await t.rollback();
-      console.error('âŒ Giveaway distribute error:', e);
-      res.status(400).json({ message: e.message });
     }
-  });
+    
+    await t.commit();
 
+    res.json({ 
+      message: 'Giveaway set successfully',
+      percentagePerUser: parsedPercentage,
+      createdGiveaways: createdGiveaways
+    });
 
-  // 7. GET /admin/giveaway/distribution-preview/:category
-  router.get('/giveaway/distribution-preview/:category', async (req, res) => {
-    try {
-      const { category } = req.params;
-      
-      const giveaway = await Giveaway.findOne({ 
-        where: { category, distributed: false },
-        attributes: ['id', 'amountPerUser'],
-        raw: true
-      });
-      
-      if (!giveaway) {
-        return res.status(404).json({ message: 'No active giveaway' });
-      }
+  } catch (e) {
+    await t.rollback();
+    console.error('❌ Set giveaway error:', e);
+    res.status(500).json({ message: e.message || 'Failed to set giveaway' });
+  }
+});
 
-      const eligibleUsersResult = await sequelize.query(`
-        SELECT COUNT(DISTINCT fromUserId) as count
-        FROM BubbleTransactions
-        WHERE type = 'back'
-        AND status = 'completed'
-      `, {
-        type: sequelize.QueryTypes.SELECT
-      });
+// 3. POST /admin/giveaway/reset - Delete all giveaways
+router.post('/giveaway/reset', async (req, res) => {
+  try {
+    console.log('🔵 POST /admin/giveaway/reset called');
+    
+    // Reset user reward tracking
+    await sequelize.query(`DELETE FROM user_giveaway_rewards`);
+    
+    const result = await Giveaway.destroy({ 
+      where: { distributed: false } 
+    });
 
-      const eligibleCount = eligibleUsersResult[0]?.count || 0;
+    res.json({ 
+      message: 'All giveaways reset',
+      deletedCount: result
+    });
+  } catch (e) {
+    console.error('❌ Reset giveaway error:', e);
+    res.status(500).json({ message: e.message }); 
+  }
+});
 
-      res.json({
-        giveawayId: giveaway.id,
-        category,
-        amountPerUser: giveaway.amountPerUser,
-        eligibleUsers: eligibleCount
-      });
-    } catch (e) {
-      console.error('âŒ Preview error:', e);
-      res.status(400).json({ message: e.message });
+// 4. Toggle category active status
+router.post('/giveaway/:category/toggle', async (req, res) => {
+  const { category } = req.params;
+  const { isActive } = req.body;
+
+  if (!['Medical', 'Grocery', 'Education'].includes(category)) {
+    return res.status(400).json({ message: 'Invalid category' });
+  }
+
+  if (typeof isActive !== 'boolean') {
+    return res.status(400).json({ message: 'isActive must be a boolean' });
+  }
+
+  try {
+    const giveaway = await Giveaway.findOne({
+      where: { category, distributed: false }
+    });
+
+    if (!giveaway) {
+      return res.status(404).json({ message: `No active ${category} giveaway found` });
     }
-  });
 
+    giveaway.isActive = isActive;
+    await giveaway.save();
+
+    res.json({
+      message: `${category} giveaway ${isActive ? 'enabled' : 'disabled'}`,
+      giveaway: {
+        id: giveaway.id,
+        category: giveaway.category,
+        percentagePerUser: giveaway.percentagePerUser,
+        isActive: giveaway.isActive
+      }
+    });
+  } catch (e) {
+    console.error('❌ Toggle category error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// 5. Update percentage for specific category
+router.post('/giveaway/:category/update-percentage', async (req, res) => {
+  const { category } = req.params;
+  const { percentagePerUser } = req.body;
+
+  if (!['Medical', 'Grocery', 'Education'].includes(category)) {
+    return res.status(400).json({ message: 'Invalid category' });
+  }
+
+  const parsedPercentage = parseFloat(percentagePerUser);
+  if (isNaN(parsedPercentage) || parsedPercentage <= 0 || parsedPercentage > 100) {
+    return res.status(400).json({ message: 'Percentage must be between 1 and 100' });
+  }
+
+  try {
+    const giveaway = await Giveaway.findOne({
+      where: { category, distributed: false }
+    });
+
+    if (!giveaway) {
+      return res.status(404).json({ message: `No active ${category} giveaway found` });
+    }
+
+    giveaway.percentagePerUser = parsedPercentage;
+    await giveaway.save();
+
+    res.json({
+      message: `${category} percentage updated to ${parsedPercentage}%`,
+      giveaway: {
+        id: giveaway.id,
+        category: giveaway.category,
+        percentagePerUser: giveaway.percentagePerUser,
+        holdAmount: giveaway.holdAmount,
+        isActive: giveaway.isActive
+      }
+    });
+  } catch (e) {
+    console.error('❌ Update percentage error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// 6. Add funds to giveaway pool
+router.post('/giveaway/:category/add-funds', async (req, res) => {
+  const { category } = req.params;
+  const { amount } = req.body;
+
+  if (!['Medical', 'Grocery', 'Education'].includes(category)) {
+    return res.status(400).json({ message: 'Invalid category' });
+  }
+
+  const parsedAmount = parseInt(amount);
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    return res.status(400).json({ message: 'Amount must be > 0' });
+  }
+
+  try {
+    const giveaway = await Giveaway.findOne({
+      where: { category, distributed: false }
+    });
+
+    if (!giveaway) {
+      return res.status(404).json({ message: `No active ${category} giveaway found` });
+    }
+
+    giveaway.totalAmount = (giveaway.totalAmount || 0) + parsedAmount;
+    await giveaway.save();
+
+    res.json({
+      message: `Added ${parsedAmount} bubbles to ${category} giveaway`,
+      giveaway: {
+        id: giveaway.id,
+        category: giveaway.category,
+        totalAmount: giveaway.totalAmount,
+        holdAmount: giveaway.holdAmount,
+        availablePool: giveaway.totalAmount + (giveaway.holdAmount || 0)
+      }
+    });
+  } catch (e) {
+    console.error('❌ Add funds error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// 7. GET /admin/giveaway/:category - Get single category details
+router.get('/giveaway/:category', async (req, res) => {
+  const { category } = req.params;
+
+  if (!['Medical', 'Grocery', 'Education'].includes(category)) {
+    return res.status(400).json({ message: 'Invalid category' });
+  }
+
+  try {
+    const giveaway = await Giveaway.findOne({
+      where: { category, distributed: false },
+      raw: true
+    });
+
+    if (!giveaway) {
+      return res.json({ found: false, message: 'No active giveaway' });
+    }
+
+    res.json({ 
+      found: true, 
+      giveaway: {
+        ...giveaway,
+        availablePool: (giveaway.totalAmount || 0) + (giveaway.holdAmount || 0)
+      }
+    });
+  } catch (e) {
+    console.error('❌ Get giveaway error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// 8. POST /admin/giveaway/:category/reset - Reset specific category
+router.post('/giveaway/:category/reset', async (req, res) => {
+  const { category } = req.params;
+
+  if (!['Medical', 'Grocery', 'Education'].includes(category)) {
+    return res.status(400).json({ message: 'Invalid category' });
+  }
+
+  try {
+    // Reset reward tracking for this category
+    await sequelize.query(`DELETE FROM user_giveaway_rewards WHERE category = :category`, {
+      replacements: { category }
+    });
+    
+    const result = await Giveaway.destroy({ 
+      where: { category, distributed: false } 
+    });
+
+    res.json({ 
+      message: `${category} giveaway reset`,
+      deletedCount: result
+    });
+  } catch (e) {
+    console.error('❌ Reset category error:', e);
+    res.status(500).json({ message: e.message });
+  }
+});
+
+// 9. GET /admin/giveaway/distribution-preview/:category
+router.get('/giveaway/distribution-preview/:category', async (req, res) => {
+  try {
+    const { category } = req.params;
+    
+    const giveaway = await Giveaway.findOne({ 
+      where: { category, distributed: false },
+      raw: true
+    });
+    
+    if (!giveaway) {
+      return res.status(404).json({ message: 'No active giveaway' });
+    }
+
+    const eligibleUsersResult = await sequelize.query(`
+      SELECT COUNT(DISTINCT fromUserId) as count
+      FROM bubble_transactions
+      WHERE type = 'back'
+      AND status = 'completed'
+    `, {
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    res.json({
+      giveawayId: giveaway.id,
+      category,
+      percentagePerUser: giveaway.percentagePerUser,
+      availablePool: (giveaway.totalAmount || 0) + (giveaway.holdAmount || 0),
+      eligibleUsers: eligibleUsersResult[0]?.count || 0
+    });
+  } catch (e) {
+    console.error('❌ Preview error:', e);
+    res.status(400).json({ message: e.message });
+  }
+});
 
 
 
@@ -1759,15 +1800,19 @@
       await user.save({ transaction: t });
 
       // Create transaction record
-      await BubbleTransaction.create({
-        fromUserId: adminId,
-        toUserId: user.id,
-        bubbleAmount: shortfall,
-        type: 'transfer',
-        status: 'completed',
-        description: `Admin approved shortfall for Offer #${offerRequest.offerId} - ${offerRequest.Brand?.name || 'Brand'}`,
-        giveaway: 0
-      }, { transaction: t });
+      // Create transaction record with clear description for user
+const brandName = offerRequest.Brand?.name || 'Unknown Brand';
+const offerTitle = offerRequest.Offer?.title || 'Offer';
+
+await BubbleTransaction.create({
+  fromUserId: adminId,
+  toUserId: user.id,
+  bubbleAmount: shortfall,
+  type: 'admin_offer_support', // ✅ NEW TYPE
+  status: 'completed',
+  description: `Offer Request: ${offerTitle} at ${brandName} - Admin Support: ${shortfall} bubbles`,
+  giveaway: 0
+}, { transaction: t });
 
       // âœ… CHANGE STATUS TO 'completed' INSTEAD OF 'accepted'
       offerRequest.status = 'completed';

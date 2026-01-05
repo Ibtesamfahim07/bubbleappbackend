@@ -1334,23 +1334,6 @@ router.post('/support', async (req, res) => {
       
       toUser.bubblesCount = parseInt(toUser.bubblesCount) + earned;
       
-      // ✅ ADD 100 BUBBLE BONUS AS SEPARATE TRANSACTION
-      toUser.bubblesCount = parseInt(toUser.bubblesCount) + 100;
-      
-      await BubbleTransaction.create({
-        fromUserId: req.user.id,
-        toUserId: parseInt(toUserId),
-        bubbleAmount: 100,
-        targetSlotNumber,
-        type: 'support',
-        status: 'completed',
-        queuePosition: 0,
-        slotsOpened: 0,
-        description: `Slot completion bonus for Slot #${targetSlotNumber}`
-      }, { transaction: t });
-      
-      console.log(`💰 User earns 400 (slot) + 100 (bonus) = 500 bubbles`);
-      
       delete toSlotProgress[slotKey];
       
       const oldKeys = Object.keys(toSlotProgress).map(k => parseInt(k)).sort((a, b) => a - b);
@@ -1462,7 +1445,7 @@ router.post('/support', async (req, res) => {
     
     res.json({
       message: slotCompleted 
-        ? `Slot ${targetSlotNumber} completed! ${toUser.name} earned ${earned + 100} bubbles (${earned} + 100 bonus)!` 
+        ? `Slot ${targetSlotNumber} completed! ${toUser.name} earned ${earned} bubbles!` 
         : `Supported slot ${targetSlotNumber}: ${newProgress}/${REQUIRED}`,
       slotCompleted,
       slotNumber: targetSlotNumber,
@@ -1654,9 +1637,13 @@ router.post('/giveaway/donate', async (req, res) => {
     const percentage = parseFloat(giveaway.percentagePerUser) || 25;
     console.log(`   Percentage: ${percentage}%`);
 
-    // 3. Deduct from donor
+    // 3. Deduct from donor and add to pool
     donor.bubblesCount -= bubbles;
     await donor.save({ transaction: t });
+
+    giveaway.totalAmount = (giveaway.totalAmount || 0) + bubbles;
+    const availablePool = giveaway.totalAmount + (giveaway.holdAmount || 0);
+    console.log(`   Pool after donation: ${availablePool}`);
 
     // 4. Record donation transaction
     await BubbleTransaction.create({
@@ -1669,7 +1656,7 @@ router.post('/giveaway/donate', async (req, res) => {
       description: `Donated ${bubbles} to ${category} Giveaway Pool`,
     }, { transaction: t });
 
-    // 5. Get eligible users - EXCLUDE users who received giveaway in ANY category
+    // 5. Get eligible users with their giveback amounts
     let eligibleQuery = `
       SELECT 
         u.id, 
@@ -1683,10 +1670,6 @@ router.post('/giveaway/donate', async (req, res) => {
         AND u.id != :donorId
         AND bt.type = 'back'
         AND bt.status = 'completed'
-        AND u.id NOT IN (
-          SELECT DISTINCT userId FROM user_giveaway_rewards 
-          WHERE totalRewardsReceived > 0
-        )
     `;
 
     if (location && location !== 'All') {
@@ -1710,76 +1693,70 @@ router.post('/giveaway/donate', async (req, res) => {
       transaction: t,
     });
 
-    console.log(`   Eligible users: ${eligibleUsers.length}`);
-
-    // 6. If NO eligible users, add entire amount to holdAmount
     if (eligibleUsers.length === 0) {
-      console.log(`   ⚠️ No eligible users - adding ${bubbles} to holdAmount`);
-      
-      giveaway.holdAmount = (parseInt(giveaway.holdAmount) || 0) + bubbles;
-      giveaway.totalDonated = (parseInt(giveaway.totalDonated) || 0) + bubbles;
-      await giveaway.save({ transaction: t });
-
-      await t.commit();
-
-      const updatedDonor = await User.findByPk(donorId, {
-        attributes: ['id', 'name', 'email', 'bubblesCount', 'queuePosition', 'queueBubbles', 'queueSlots']
-      });
-
-      return res.json({
-        success: true,
-        message: `No eligible users found. ${bubbles} bubbles added to ${category} giveaway hold pool.`,
-        distribution: {
-          giveawayId: giveaway.id,
-          category,
-          percentage: percentage,
-          totalDonated: bubbles,
-          totalDistributed: 0,
-          heldForLater: bubbles,
-          recipientCount: 0,
-          recipients: [],
-          location: location || 'All',
-        },
-        updatedUser: {
-          id: updatedDonor.id,
-          name: updatedDonor.name,
-          email: updatedDonor.email,
-          bubblesCount: parseInt(updatedDonor.bubblesCount),
-          queuePosition: updatedDonor.queuePosition,
-          queueBubbles: updatedDonor.queueBubbles,
-          queueSlots: updatedDonor.queueSlots
-        }
+      await t.rollback();
+      return res.status(400).json({ 
+        message: location && location !== 'All' 
+          ? `No eligible users found in ${location}.`
+          : 'No eligible users found.'
       });
     }
 
-    // 7. Calculate available pool (donation + existing hold)
-    const availablePool = bubbles + (parseInt(giveaway.holdAmount) || 0);
-    console.log(`   Available pool: ${availablePool} (donation: ${bubbles} + hold: ${giveaway.holdAmount || 0})`);
+    console.log(`   Eligible users: ${eligibleUsers.length}`);
 
-    // 8. Calculate rewards based on giveback amounts
+    // 6. Get existing reward records
+    const userIds = eligibleUsers.map(u => u.id);
+    const existingRewards = await sequelize.query(`
+      SELECT userId, lastRewardedGivebackAmount, totalRewardsReceived
+      FROM user_giveaway_rewards
+      WHERE userId IN (:userIds) AND category = :category
+    `, {
+      replacements: { userIds, category },
+      type: sequelize.QueryTypes.SELECT,
+      transaction: t
+    });
+
+    const rewardMap = new Map();
+    for (const r of existingRewards) {
+      rewardMap.set(r.userId, {
+        lastRewarded: r.lastRewardedGivebackAmount || 0,
+        totalReceived: r.totalRewardsReceived || 0
+      });
+    }
+
+    // 7. Calculate rewards based on NEW giveback amounts only
     const distributions = [];
     let totalToDistribute = 0;
 
     for (const user of eligibleUsers) {
       const totalGiveback = parseInt(user.totalGiveback);
-      const reward = Math.floor(totalGiveback * (percentage / 100));
+      const existing = rewardMap.get(user.id) || { lastRewarded: 0, totalReceived: 0 };
       
-      if (reward > 0) {
-        distributions.push({
-          userId: user.id,
-          name: user.name,
-          location: `${user.area || ''} ${user.city || ''}`.trim() || 'Unknown',
-          totalGiveback: totalGiveback,
-          calculatedReward: reward,
-          actualReward: 0
-        });
-        totalToDistribute += reward;
+      const newGivebackAmount = totalGiveback - existing.lastRewarded;
+      
+      if (newGivebackAmount > 0) {
+        const reward = Math.floor(newGivebackAmount * (percentage / 100));
+        
+        if (reward > 0) {
+          distributions.push({
+            userId: user.id,
+            name: user.name,
+            location: `${user.area || ''} ${user.city || ''}`.trim() || 'Unknown',
+            totalGiveback: totalGiveback,
+            previouslyRewarded: existing.lastRewarded,
+            newGivebackAmount: newGivebackAmount,
+            calculatedReward: reward,
+            actualReward: 0
+          });
+          totalToDistribute += reward;
+        }
       }
     }
 
     console.log(`   Total calculated rewards: ${totalToDistribute}`);
+    console.log(`   Available pool: ${availablePool}`);
 
-    // 9. Adjust rewards if pool is insufficient
+    // 8. Adjust rewards if pool is insufficient
     let actualDistributed = 0;
 
     if (totalToDistribute <= availablePool) {
@@ -1795,46 +1772,22 @@ router.post('/giveaway/donate', async (req, res) => {
       }
     }
 
-    // 10. Create transactions and update balances
+    // 9. Create transactions and update balances
     const recipientsList = [];
-    const adminId = giveaway.setByAdminId || donorId;
+    const transactionsToCreate = [];
 
     for (const d of distributions) {
       if (d.actualReward > 0) {
-        await BubbleTransaction.create({
-          fromUserId: adminId,
+        transactionsToCreate.push({
+          fromUserId: donorId,
           toUserId: d.userId,
           bubbleAmount: d.actualReward,
-          type: 'giveaway_reward',
+          type: 'transfer',
           status: 'completed',
           giveaway: 1,
-          description: `${category} Giveaway (${percentage}% of ${d.totalGiveback} giveback)`,
-        }, { transaction: t });
-
-        await sequelize.query(`
-          UPDATE users SET bubblesCount = bubblesCount + :amount WHERE id = :userId
-        `, {
-          replacements: { amount: d.actualReward, userId: d.userId },
-          transaction: t
-        });
-
-        // Update reward tracking
-        await sequelize.query(`
-          INSERT INTO user_giveaway_rewards (userId, category, lastRewardedGivebackAmount, totalRewardsReceived, lastRewardedAt, createdAt, updatedAt)
-          VALUES (:userId, :category, :totalGiveback, :reward, NOW(), NOW(), NOW())
-          ON DUPLICATE KEY UPDATE 
-            lastRewardedGivebackAmount = :totalGiveback,
-            totalRewardsReceived = totalRewardsReceived + :reward,
-            lastRewardedAt = NOW(),
-            updatedAt = NOW()
-        `, {
-          replacements: { 
-            userId: d.userId, 
-            category,
-            totalGiveback: d.totalGiveback,
-            reward: d.actualReward
-          },
-          transaction: t
+          description: `${category} Giveaway (${percentage}% of ${d.newGivebackAmount} giveback)`,
+          createdAt: new Date(),
+          updatedAt: new Date(),
         });
 
         recipientsList.push({
@@ -1843,16 +1796,52 @@ router.post('/giveaway/donate', async (req, res) => {
           name: d.name,
           location: d.location,
           totalGiveback: d.totalGiveback,
+          newGiveback: d.newGivebackAmount,
           received: d.actualReward,
         });
       }
     }
 
-    // 11. Update giveaway - reset totalAmount, update holdAmount with remainder
+    if (transactionsToCreate.length > 0) {
+      await BubbleTransaction.bulkCreate(transactionsToCreate, { transaction: t });
+    }
+
+    // Update user balances and reward tracking
+    for (const d of distributions) {
+      if (d.actualReward > 0) {
+        await sequelize.query(`
+          UPDATE users SET bubblesCount = bubblesCount + :amount WHERE id = :userId
+        `, {
+          replacements: { amount: d.actualReward, userId: d.userId },
+          transaction: t
+        });
+
+        await sequelize.query(`
+          INSERT INTO user_giveaway_rewards (userId, category, lastRewardedGivebackAmount, totalRewardsReceived, lastRewardedAt, createdAt, updatedAt)
+          VALUES (:userId, :category, :lastRewarded, :totalReceived, NOW(), NOW(), NOW())
+          ON DUPLICATE KEY UPDATE 
+            lastRewardedGivebackAmount = :lastRewarded,
+            totalRewardsReceived = totalRewardsReceived + :reward,
+            lastRewardedAt = NOW(),
+            updatedAt = NOW()
+        `, {
+          replacements: { 
+            userId: d.userId, 
+            category,
+            lastRewarded: d.totalGiveback,
+            totalReceived: d.actualReward,
+            reward: d.actualReward
+          },
+          transaction: t
+        });
+      }
+    }
+
+    // 10. Update giveaway pool
     const holdAmount = availablePool - actualDistributed;
     giveaway.totalAmount = 0;
     giveaway.holdAmount = holdAmount;
-    giveaway.totalDonated = (parseInt(giveaway.totalDonated) || 0) + bubbles;
+    giveaway.totalDonated = (giveaway.totalDonated || 0) + bubbles;
     await giveaway.save({ transaction: t });
 
     console.log(`   Actually distributed: ${actualDistributed}`);
@@ -1896,10 +1885,6 @@ router.post('/giveaway/donate', async (req, res) => {
   }
 });
 
-
-// ==================== FLOW 1: UPDATED ELIGIBLE USERS PREVIEW ====================
-// Also update the eligible-users endpoint to exclude users who received ANY giveaway
-
 router.get('/giveaway/eligible-users/:category', async (req, res) => {
   try {
     const { category } = req.params;
@@ -1920,7 +1905,6 @@ router.get('/giveaway/eligible-users/:category', async (req, res) => {
         eligibleCount: 0,
         percentage: giveaway.percentagePerUser || 25,
         availablePool: 0,
-        holdAmount: giveaway.holdAmount || 0,
         topDonors: [],
         isActive: false,
         disabledMessage: `${category} giveaway is currently disabled by admin`
@@ -1930,31 +1914,30 @@ router.get('/giveaway/eligible-users/:category', async (req, res) => {
     const percentage = parseFloat(giveaway.percentagePerUser) || 25;
     const availablePool = (giveaway.totalAmount || 0) + (giveaway.holdAmount || 0);
 
-    // UPDATED: Exclude users who received giveaway in ANY category
+    // ✅ FIXED: Use subquery to avoid HAVING alias issue
     let query = `
       SELECT 
         sub.id,
         sub.name,
         sub.area,
         sub.city,
-        sub.totalGiveback
+        sub.totalGiveback,
+        sub.lastRewarded
       FROM (
         SELECT 
           u.id, 
           u.name, 
           u.area, 
           u.city,
-          COALESCE(SUM(bt.bubbleAmount), 0) AS totalGiveback
+          COALESCE(SUM(bt.bubbleAmount), 0) AS totalGiveback,
+          COALESCE(MAX(ugr.lastRewardedGivebackAmount), 0) AS lastRewarded
         FROM users u
         JOIN bubble_transactions bt ON bt.fromUserId = u.id
+        LEFT JOIN user_giveaway_rewards ugr ON ugr.userId = u.id AND ugr.category = :category
         WHERE u.isActive = 1 
           AND u.id != :donorId
           AND bt.type = 'back'
           AND bt.status = 'completed'
-          AND u.id NOT IN (
-            SELECT DISTINCT userId FROM user_giveaway_rewards 
-            WHERE totalRewardsReceived > 0
-          )
     `;
 
     if (location && location !== 'All') {
@@ -1968,26 +1951,28 @@ router.get('/giveaway/eligible-users/:category', async (req, res) => {
 
     query += `
         GROUP BY u.id, u.name, u.area, u.city
-      ) sub
-      WHERE sub.totalGiveback > 0
-      ORDER BY sub.totalGiveback DESC
+      ) AS sub
+      WHERE sub.totalGiveback > sub.lastRewarded
+      ORDER BY (sub.totalGiveback - sub.lastRewarded) DESC
     `;
 
     const eligibleUsers = await sequelize.query(query, {
       replacements: { donorId, category, ...(location && location !== 'All' ? { location } : {}) },
-      type: sequelize.QueryTypes.SELECT
+      type: sequelize.QueryTypes.SELECT,
     });
 
-    // Calculate potential rewards
-    const topDonors = eligibleUsers.slice(0, 10).map((user, index) => {
-      const reward = Math.floor(parseInt(user.totalGiveback) * (percentage / 100));
+    const topDonors = eligibleUsers.slice(0, 5).map((user, index) => {
+      const newGiveback = user.totalGiveback - user.lastRewarded;
+      const potentialReward = Math.floor(newGiveback * (percentage / 100));
+      
       return {
         rank: index + 1,
-        id: user.id,
+        userId: user.id,
         name: user.name,
         location: `${user.area || ''} ${user.city || ''}`.trim() || 'Unknown',
-        totalGiveback: parseInt(user.totalGiveback),
-        potentialReward: reward
+        totalGiveback: user.totalGiveback,
+        newGiveback: newGiveback,
+        potentialReward: potentialReward
       };
     });
 
@@ -1996,14 +1981,13 @@ router.get('/giveaway/eligible-users/:category', async (req, res) => {
       percentage: percentage,
       availablePool: availablePool,
       holdAmount: giveaway.holdAmount || 0,
-      topDonors: topDonors,
-      isActive: true,
-      locationApplied: location || 'All Locations'
+      topDonors,
+      locationApplied: location && location !== 'All' ? location : 'All Locations',
+      isActive: true
     });
-
-  } catch (error) {
-    console.error('Get eligible users error:', error);
-    res.status(400).json({ message: error.message });
+  } catch (e) {
+    console.error('❌ Get eligible users error:', e);
+    res.status(400).json({ message: e.message || 'Failed to get eligible users' });
   }
 });
 
@@ -2395,10 +2379,6 @@ router.get('/user/bubble-breakdown', async (req, res) => {
   }
 });
 
-
-
-
-
 router.get('/user/bubble-diagnostic', async (req, res) => {
   try {
     const userId = req.user.id;
@@ -2646,121 +2626,53 @@ router.post('/give-back', async (req, res) => {
 
     console.log(`   ✅ Created back transaction: ${bubbleTransaction.id}`);
 
-    // ========== GET ALL ACTIVE GIVEAWAYS ==========
-    const [activeGiveaways] = await sequelize.query(`
-      SELECT id, category, percentagePerUser, holdAmount, setByAdminId
-      FROM giveaways 
-      WHERE distributed = 0 
-        AND isActive = 1
-      ORDER BY category ASC
-    `, { transaction: t });
+    // ========== AUTOMATIC GIVEAWAY REWARDS FROM ALL CATEGORIES ==========
+    // Check all active giveaways and give rewards from holdAmount
+    
+    // ========== AUTOMATIC GIVEAWAY REWARDS FROM ALL CATEGORIES ==========
+const [activeGiveaways] = await sequelize.query(`
+  SELECT id, category, percentagePerUser, holdAmount, totalDonated, setByAdminId
+  FROM giveaways 
+  WHERE distributed = 0 
+    AND isActive = 1
+    AND holdAmount > 0
+`, { transaction: t });
 
-    let totalRewardGiven = 0;
-    const rewardsBreakdown = [];
+let totalRewardGiven = 0;
+const rewardsBreakdown = [];
 
-    if (activeGiveaways.length > 0) {
-      // Get the percentage (should be same for all, use first one)
-      const percentagePerUser = parseFloat(activeGiveaways[0].percentagePerUser) || 25;
-      
-      // Calculate total reward
-      const totalReward = Math.floor(amountToGiveBack * (percentagePerUser / 100));
-      console.log(`   💰 Total reward to distribute: ${totalReward} (${percentagePerUser}% of ${amountToGiveBack})`);
+for (const giveaway of activeGiveaways) {
+  const category = giveaway.category;
+  const percentagePerUser = parseFloat(giveaway.percentagePerUser) || 25;
+  const availableHold = parseInt(giveaway.holdAmount) || 0;
+  const adminId = giveaway.setByAdminId || 1; // Use admin who set up giveaway, or fallback to ID 1
 
-      if (totalReward > 0) {
-        // ========== EQUAL DISTRIBUTION WITH SMART REDISTRIBUTION ==========
-        const categoryCount = activeGiveaways.length;
-        const baseAmount = Math.floor(totalReward / categoryCount);
-        let remainder = totalReward - (baseAmount * categoryCount);
+  // Calculate reward based on this giveback amount
+  const calculatedReward = Math.floor(amountToGiveBack * (percentagePerUser / 100));
+  
+  // Only give what's available in holdAmount
+  const actualReward = Math.min(calculatedReward, availableHold);
 
-        // Build initial distribution
-        const categoryDistribution = activeGiveaways.map((g, index) => ({
-          id: g.id,
-          category: g.category,
-          holdAmount: parseInt(g.holdAmount) || 0,
-          adminId: g.setByAdminId || 1,
-          targetAmount: baseAmount + (index < remainder ? 1 : 0), // Distribute remainder
-          actualAmount: 0,
-          deficit: 0
-        }));
+  if (actualReward > 0) {
+    console.log(`   📊 ${category}: Calculated ${calculatedReward}, Available ${availableHold}, Giving ${actualReward}`);
 
-        console.log(`   📊 Initial distribution plan:`, categoryDistribution.map(c => `${c.category}: ${c.targetAmount}`).join(', '));
-
-        // ========== SMART REDISTRIBUTION ALGORITHM ==========
-        let iterations = 0;
-        const maxIterations = 10;
-        
-        while (iterations < maxIterations) {
-          iterations++;
-          let totalDeficit = 0;
-          let totalSurplus = 0;
-          const surplusCategories = [];
-
-          // Calculate what each category can give
-          for (const cat of categoryDistribution) {
-            const canGive = Math.min(cat.targetAmount, cat.holdAmount);
-            cat.actualAmount = canGive;
-            cat.deficit = cat.targetAmount - canGive;
-            
-            if (cat.deficit > 0) {
-              totalDeficit += cat.deficit;
-            }
-            
-            // Check if this category has surplus capacity
-            const surplusCapacity = cat.holdAmount - cat.actualAmount;
-            if (surplusCapacity > 0) {
-              surplusCategories.push({ cat, surplusCapacity });
-              totalSurplus += surplusCapacity;
-            }
-          }
-
-          console.log(`   🔄 Iteration ${iterations}: Deficit=${totalDeficit}, Surplus=${totalSurplus}`);
-
-          // If no deficit, we're done
-          if (totalDeficit === 0) break;
-
-          // If no surplus available, we can't redistribute
-          if (totalSurplus === 0) break;
-
-          // Redistribute deficit to categories with surplus
-          let remainingDeficit = totalDeficit;
-          
-          for (const { cat, surplusCapacity } of surplusCategories) {
-            if (remainingDeficit <= 0) break;
-            
-            const takeFromThis = Math.min(surplusCapacity, remainingDeficit);
-            cat.targetAmount += takeFromThis;
-            remainingDeficit -= takeFromThis;
-          }
-
-          // Reduce target for categories with insufficient hold
-          for (const cat of categoryDistribution) {
-            if (cat.deficit > 0) {
-              cat.targetAmount = cat.holdAmount; // Cap at what's available
-            }
-          }
-        }
-
-        // ========== APPLY THE DISTRIBUTION ==========
-for (const cat of categoryDistribution) {
-  if (cat.actualAmount > 0) {
-    // Deduct from holdAmount AND totalAmount
+    // Deduct from giveaway holdAmount
     await sequelize.query(`
       UPDATE giveaways 
-      SET holdAmount = holdAmount - :amount,
-          totalAmount = totalAmount - :amount,
+      SET holdAmount = holdAmount - :actualReward,
           updatedAt = NOW()
       WHERE id = :giveawayId
     `, {
-      replacements: { amount: cat.actualAmount, giveawayId: cat.id },
+      replacements: { actualReward, giveawayId: giveaway.id },
       transaction: t
     });
 
-    // Update user_giveaway_rewards tracking
+    // Update or insert user_giveaway_rewards tracking
     const [existingReward] = await sequelize.query(`
       SELECT id FROM user_giveaway_rewards
       WHERE userId = :userId AND category = :category
     `, {
-      replacements: { userId: fromUserId, category: cat.category },
+      replacements: { userId: fromUserId, category },
       transaction: t
     });
 
@@ -2768,17 +2680,12 @@ for (const cat of categoryDistribution) {
       await sequelize.query(`
         UPDATE user_giveaway_rewards 
         SET lastRewardedGivebackAmount = lastRewardedGivebackAmount + :amountToGiveBack,
-            totalRewardsReceived = totalRewardsReceived + :reward,
+            totalRewardsReceived = totalRewardsReceived + :actualReward,
             lastRewardedAt = NOW(),
             updatedAt = NOW()
         WHERE userId = :userId AND category = :category
       `, {
-        replacements: { 
-          amountToGiveBack: Math.floor(amountToGiveBack / categoryCount), 
-          reward: cat.actualAmount, 
-          userId: fromUserId, 
-          category: cat.category 
-        },
+        replacements: { amountToGiveBack, actualReward, userId: fromUserId, category },
         transaction: t
       });
     } else {
@@ -2786,52 +2693,34 @@ for (const cat of categoryDistribution) {
         INSERT INTO user_giveaway_rewards 
           (userId, category, lastRewardedGivebackAmount, totalRewardsReceived, lastRewardedAt, createdAt, updatedAt)
         VALUES 
-          (:userId, :category, :amountToGiveBack, :reward, NOW(), NOW(), NOW())
+          (:userId, :category, :amountToGiveBack, :actualReward, NOW(), NOW(), NOW())
       `, {
-        replacements: { 
-          userId: fromUserId, 
-          category: cat.category, 
-          amountToGiveBack: Math.floor(amountToGiveBack / categoryCount), 
-          reward: cat.actualAmount 
-        },
+        replacements: { userId: fromUserId, category, amountToGiveBack, actualReward },
         transaction: t
       });
     }
 
-    // Create reward transaction
+    // ✅ FIXED: Create reward transaction - fromUserId is admin/system, NOT the user
     await BubbleTransaction.create({
-      fromUserId: cat.adminId,
-      toUserId: fromUserId,
-      bubbleAmount: cat.actualAmount,
+      fromUserId: adminId,        // FROM giveaway (admin who set it up)
+      toUserId: fromUserId,       // TO the user receiving reward
+      bubbleAmount: actualReward,
       type: 'giveaway_reward',
       status: 'completed',
       giveaway: 1,
-      description: `${cat.category} Giveaway Reward`
+      description: `${category} Giveaway Reward (${percentagePerUser}% of ${amountToGiveBack})`
     }, { transaction: t });
 
-    totalRewardGiven += cat.actualAmount;
+    totalRewardGiven += actualReward;
     rewardsBreakdown.push({
-      category: cat.category,
-      requested: cat.targetAmount,
-      received: cat.actualAmount,
-      remainingHold: cat.holdAmount - cat.actualAmount
+      category,
+      percentage: percentagePerUser,
+      reward: actualReward
     });
 
-    console.log(`   ✅ ${cat.category}: Gave ${cat.actualAmount} bubbles (had ${cat.holdAmount} in hold)`);
-  } else {
-    rewardsBreakdown.push({
-      category: cat.category,
-      requested: cat.targetAmount,
-      received: 0,
-      remainingHold: cat.holdAmount
-    });
-    console.log(`   ⚠️ ${cat.category}: No reward (0 in hold)`);
+    console.log(`   ✅ ${category}: Gave ${actualReward} bubbles as reward`);
   }
 }
-      }
-    } else {
-      console.log(`   ⚠️ No active giveaways found`);
-    }
 
     // ========== ADD TOTAL REWARDS TO USER BALANCE ==========
     if (totalRewardGiven > 0) {
